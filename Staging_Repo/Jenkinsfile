@@ -97,7 +97,7 @@ spec:
             withCredentials([usernamePassword(credentialsId: NEXUS_CRED_ID, usernameVariable: 'NEXUS_USER', passwordVariable: 'NEXUS_PASS')]) {
 
                 script {
-                    // Encode Nexus credentials for Kaniko push
+                    
                     def encodedAuth = sh(
                                 script: "echo -n \"${NEXUS_USER}:${NEXUS_PASS}\" | base64",
                                 returnStdout: true
@@ -108,7 +108,7 @@ spec:
                     sh "echo '${DOCKER_CONFIG_JSON}' > /kaniko/.docker/config.json"
                 }
 
-                // Ensure /kaniko exists
+                
                 sh "mkdir -p /shared-storage"
 
                 echo "Building image as tar..."
@@ -176,10 +176,10 @@ spec:
     checkout scm 
     
     script {
-        // 1. Fix the ownership security error
-        sh "git config --global --add safe.directory /home/jenkins/agent/workspace/Stating"
         
-        // 2. Fetch history now that Git trusts the folder
+        sh "git config --global --add safe.directory /home/jenkins/agent/workspace/Staging"
+        
+        
         sh "git fetch --unshallow || git fetch --depth=2"
         
         def lastCommit = env.GIT_PREVIOUS_SUCCESSFUL_COMMIT ?: "HEAD~1"
