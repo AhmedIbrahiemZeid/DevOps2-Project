@@ -1,0 +1,218 @@
+---
+- name: Install and configure Kubernetes Master node
+  hosts: DevOps
+  become: true
+  vars:
+    pod_network_cidr: 10.10.0.0/16
+    kube_user: zeid
+    calico_manifest: /tmp/calico.yaml
+    kubeconfig_path: /home/{{ kube_user }}/.kube/config
+    helm_version: v3.14.4
+    helm_tarball: /tmp/helm.tar.gz
+    helm_binary_path: /usr/local/bin/helm
+  tasks:
+    - name: Disable swap at runtime
+      command: swapoff -a
+      when: ansible_swaptotal_mb > 0
+      changed_when: true
+    - name: Disable swap permanently
+      ansible.builtin.mount:
+        name: swap
+        fstype: swap
+        state: absent
+    - name: Disable SELinux at runtime
+      command: setenforce 0
+      when: ansible_selinux.status == "enabled" and ansible_selinux.mode != "disabled"
+      changed_when: true
+    - name: Disable SELinux permanently
+      ansible.posix.selinux:
+        state: disabled
+    - name: Ensure firewalld is running
+      service:
+        name: firewalld
+        state: started
+        enabled: yes
+    - name: Open Kubernetes required ports
+      ansible.posix.firewalld:
+        port: "{{ item }}"
+        permanent: true
+        state: enabled
+        immediate: yes
+      loop:
+        - 6443/tcp
+        - 10250/tcp
+        - 2379-2380/tcp
+        - 30000-32767/tcp
+    - name: Reload firewalld
+      command: firewall-cmd --reload
+      changed_when: false
+    - name: Ensure required kernel modules are loaded
+      ansible.builtin.modprobe:
+        name: "{{ item }}"
+        state: present
+      loop:
+        - overlay
+        - br_netfilter
+    - name: Configure Kubernetes sysctl parameters
+      ansible.posix.sysctl:
+        name: "{{ item.name }}"
+        value: "{{ item.value }}"
+        sysctl_set: true
+        state: present
+        reload: true
+      loop:
+        - name: net.bridge.bridge-nf-call-iptables
+          value: 1
+        - name: net.bridge.bridge-nf-call-ip6tables
+          value: 1
+        - name: net.ipv4.ip_forward
+          value: 1
+    - name: Add Docker CE repository
+      yum_repository:
+        name: docker-ce
+        description: Docker CE Repository
+        baseurl: https://download.docker.com/linux/centos/7/x86_64/stable
+        enabled: yes
+        gpgcheck: yes
+        gpgkey: https://download.docker.com/linux/centos/gpg
+    - name: Install Docker Engine and related components
+      package:
+        name:
+          - docker-ce
+          - docker-ce-cli
+          - containerd.io
+          - docker-buildx-plugin
+          - docker-compose-plugin
+        state: present
+    - name: Ensure containerd config directory exists
+      file:
+        path: /etc/containerd
+        state: directory
+        mode: "0755"
+    - name: Generate default containerd configuration
+      command: containerd config default
+      register: containerd_config
+    - name: Overwrite containerd configuration file
+      copy:
+        dest: /etc/containerd/config.toml
+        content: "{{ containerd_config.stdout }}"
+        owner: root
+        group: root
+        mode: "0644"
+    - name: Enable SystemdCgroup in containerd config
+      replace:
+        path: /etc/containerd/config.toml
+        regexp: ^(\s*SystemdCgroup\s*=\s*)false
+        replace: \1true
+    - name: Enable and start containerd
+      service:
+        name: containerd
+        state: started
+        enabled: yes
+    - name: Enable and start Docker
+      service:
+        name: docker
+        state: started
+        enabled: yes
+    - name: Check Docker version
+      command: docker --version
+      register: docker_version
+      changed_when: false
+    - debug:
+        msg: "Docker installed successfully: {{ docker_version.stdout }}"
+    - name: Add Kubernetes repo
+      copy:
+        dest: /etc/yum.repos.d/kubernetes.repo
+        content: >
+          [kubernetes]
+
+          name=Kubernetes
+
+          baseurl=https://pkgs.k8s.io/core:/stable:/v1.30/rpm/
+
+          enabled=1
+
+          gpgcheck=1
+
+          gpgkey=https://pkgs.k8s.io/core:/stable:/v1.30/rpm/repodata/repomd.xml.key
+    - name: Install Kubernetes packages
+      package:
+        name:
+          - kubelet
+          - kubeadm
+          - kubectl
+        state: present
+    - name: Enable and start kubelet
+      systemd:
+        name: kubelet
+        enabled: true
+        state: started
+    - name: Initialize Kubernetes control plane
+      command: >
+        kubeadm init --apiserver-advertise-address={{
+        ansible_default_ipv4.address }} --apiserver-cert-extra-sans={{
+        ansible_default_ipv4.address }} --pod-network-cidr={{ pod_network_cidr
+        }} --cri-socket=unix:///var/run/containerd/containerd.sock
+      args:
+        creates: /etc/kubernetes/admin.conf
+    - name: Create .kube directory for user
+      file:
+        path: /home/{{ kube_user }}/.kube
+        state: directory
+        owner: "{{ kube_user }}"
+        group: "{{ kube_user }}"
+        mode: "0755"
+    - name: Copy kubeconfig to user home
+      copy:
+        src: /etc/kubernetes/admin.conf
+        dest: /home/{{ kube_user }}/.kube/config
+        owner: "{{ kube_user }}"
+        group: "{{ kube_user }}"
+        mode: "0600"
+        remote_src: true
+    - name: Download Calico manifest
+      get_url:
+        url: https://raw.githubusercontent.com/projectcalico/calico/v3.31.0/manifests/calico.yaml
+        dest: "{{ calico_manifest }}"
+        mode: "0644"
+    - name: Update Pod CIDR in Calico config
+      replace:
+        path: "{{ calico_manifest }}"
+        regexp: 192\\.168\\.0\\.0/16
+        replace: "{{ pod_network_cidr }}"
+    - name: Apply Calico manifest using kubectl
+      command: kubectl apply -f {{ calico_manifest }}
+      environment:
+        KUBECONFIG: "{{ kubeconfig_path }}"
+    - name: Remove default taint on control-plane node
+      command: kubectl taint nodes --all node-role.kubernetes.io/control-plane-
+      environment:
+        KUBECONFIG: "{{ kubeconfig_path }}"
+    - name: Wait for control plane to stabilize (10 minutes)
+      pause:
+        minutes: 10
+      when: kubeadm_result is succeeded
+    - name: Check if Helm is already installed
+      stat:
+        path: "{{ helm_binary_path }}"
+      register: helm_installed
+    - name: Download Helm binary
+      get_url:
+        url: https://get.helm.sh/helm-{{ helm_version }}-linux-amd64.tar.gz
+        dest: "{{ helm_tarball }}"
+      when: not helm_installed.stat.exists
+    - name: Extract Helm binary
+      unarchive:
+        src: "{{ helm_tarball }}"
+        dest: /tmp
+        remote_src: yes
+      when: not helm_installed.stat.exists
+    - name: Move Helm binary to /usr/local/bin
+      copy:
+        src: /tmp/linux-amd64/helm
+        dest: "{{ helm_binary_path }}"
+        mode: "0755"
+      when: not helm_installed.stat.exists
+    - name: Verify Helm installation
+      command: "{{ helm_binary_path }} version"
+

@@ -1,0 +1,32 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: fastapi-app-canary
+  namespace: prod
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: fastapi-app
+  template:
+    metadata:
+      labels:
+        app: fastapi-app
+    spec:
+      containers:
+      - name: fastapi-app
+        image: <YOUR_DOCKER_REGISTRY>/fastapi_postgres_app:latest
+        ports:
+        - containerPort: 8000
+        env:
+        - name: POSTGRES_HOST
+          value: "postgres-0.postgres.prod.svc.cluster.local"
+        - name: POSTGRES_DB
+          value: "mydb"
+        - name: POSTGRES_USER
+          value: "postgres"
+        - name: POSTGRES_PASSWORD
+          valueFrom:
+            secretKeyRef:
+              name: postgres-secret
+              key: POSTGRES_PASSWORD

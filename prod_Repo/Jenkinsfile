@@ -1,0 +1,216 @@
+pipeline {
+    agent none
+
+    environment {
+        NEXUS_REGISTRY_URL  = '10.10.70.84:30051'
+        NEXUS_REGISTRY_HOST = '10.10.70.84'
+        NEXUS_REGISTRY_PORT = '30051'
+        IMAGE_NAME          = 'docker-host/fastapi-postgres-app'
+        NEXUS_CRED_ID       = 'a4116a00-2da0-4947-9dcc-86ba51217d6d'
+        K8S_NAMESPACE       = 'prod'
+		WORKSPACE           = 'prod'
+    } 
+
+    stages {
+        // --- STAGE 1: CHECKOUT ---
+        stage('Checkout & Stash') {
+            agent any
+            steps {
+                checkout scm
+                sh "git config --global --add safe.directory ${WORKSPACE}"
+                stash name: 'source', includes: '**/*'
+            }
+        }
+
+       
+
+
+stage('DB Migration') {
+    agent {
+        kubernetes {
+            cloud 'kubernetes'
+            yaml '''
+apiVersion: v1
+kind: Pod
+spec:
+  containers:
+  - name: git-tool
+    image: alpine/git:latest
+    command: ["cat"]
+    args: ["-"]
+    tty: true
+  - name: psql
+    image: postgres:15
+    command: ["cat"]
+    args: ["-"]
+    tty: true
+'''
+        }
+    }
+
+    steps {
+        container('git-tool') {
+            echo "Checking for DB migration changes..."
+            checkout scm
+
+            sh "git config --global --add safe.directory \$PWD"
+            sh "git fetch --unshallow || git fetch --depth=2"
+
+            script {
+                def lastCommit = env.GIT_PREVIOUS_SUCCESSFUL_COMMIT ?: "HEAD~1"
+                def diff = sh(
+                    script: """
+                      git diff --name-only ${lastCommit} ${env.GIT_COMMIT} \
+                      | grep '^migrations/' || true
+                    """,
+                    returnStdout: true
+                ).trim()
+
+                if (diff) {
+                    echo "Migration change detected:\n${diff}"
+                    env.SHOULD_MIGRATE = "true"
+                } else {
+                    echo "No migration changes detected."
+                    env.SHOULD_MIGRATE = "false"
+                }
+            }
+        }
+
+        script {
+            if (env.SHOULD_MIGRATE == "true") {
+
+                /* ---------- MANUAL APPROVAL ---------- */
+                timeout(time: 1, unit: 'HOURS') {
+                    input message: 'DB migration detected. Approve execution?'
+                }
+
+                /* ---------- RUN MIGRATION ---------- */
+                container('psql') {
+                    echo "Starting DB migration..."
+
+                    withCredentials([usernamePassword(
+                        credentialsId: 'STAGING_DB_CRED',
+                        usernameVariable: 'DB_USER',
+                        passwordVariable: 'DB_PASS'
+                    )]) {
+                        sh """
+                        export PGPASSWORD=\$DB_PASS
+                        psql \
+                          -h postgres-0.postgres.prod.svc.cluster.local \
+                          -U \$DB_USER \
+                          -d mydb \
+                          -f migrations/001_create_users_table.sql
+                        """
+                    }
+                }
+
+            } else {
+                echo "Skipping DB migration (no changes)."
+            }
+        }
+    }
+}
+
+
+        // --- STAGE 4: CANARY DEPLOY (10% Traffic) ---
+        stage('Deploy Canary') {
+            agent {
+                kubernetes {
+                    cloud 'kubernetes'
+                    yaml """
+apiVersion: v1
+kind: Pod
+spec:
+  containers:
+  - name: kubectl
+    image: lachlanevenson/k8s-kubectl:latest
+    command: ["cat"]
+    args: ["-"]
+    tty: true
+    volumeMounts:
+      - name: kubeconfig
+        mountPath: /root/.kube
+        readOnly: true
+  volumes:
+    - name: kubeconfig
+      hostPath:
+        path: /home/zeid/.kube
+"""
+                }
+            }
+            steps {
+                container('kubectl') {
+                    withCredentials([usernamePassword(credentialsId: NEXUS_CRED_ID, usernameVariable: 'NEXUS_USER', passwordVariable: 'NEXUS_PASS')]) {
+                        script {
+                            // 1. Get the latest tag from Nexus
+							sh "apk add --no-cache curl jq"
+                            def latestTag = sh(script: "curl -s -u ${NEXUS_USER}:${NEXUS_PASS} http://${NEXUS_REGISTRY_HOST}:${NEXUS_REGISTRY_PORT}/v2/${IMAGE_NAME}/tags/list | jq -r '.tags[]' | grep latest- | sort -V | tail -n1", returnStdout: true).trim()
+                            env.LATEST_TAG = latestTag
+                            
+                            echo "Deploying Canary: ${LATEST_TAG}"
+
+                            // 2. Update Canary Deployment and scale to 1 replica
+                            sh """
+                            kubectl set image deployment/fastapi-app-canary fastapi-app=${NEXUS_REGISTRY_URL}/${IMAGE_NAME}:${LATEST_TAG} -n ${K8S_NAMESPACE}
+                            kubectl scale deployment/fastapi-app-canary --replicas=1 -n ${K8S_NAMESPACE}
+                            kubectl rollout status deployment/fastapi-app-canary -n ${K8S_NAMESPACE}
+                            """
+                        }
+                    }
+                }
+            }
+        }
+
+        // --- STAGE 5: PROMOTE TO PROD ---
+        stage('Promote to Production') {
+            agent {
+                kubernetes {
+                    cloud 'kubernetes'
+                    yaml """
+apiVersion: v1
+kind: Pod
+spec:
+  containers:
+  - name: kubectl
+    image: lachlanevenson/k8s-kubectl:latest
+    command: ["cat"]
+    args: ["-"]
+    tty: true
+    volumeMounts:
+      - name: kubeconfig
+        mountPath: /root/.kube
+        readOnly: true
+  volumes:
+    - name: kubeconfig
+      hostPath:
+        path: /home/zeid/.kube
+"""
+                }
+            }
+            steps {
+                script {
+                    try {
+                        timeout(time: 30, unit: 'MINUTES') {
+                            input message: "Canary is live (${env.LATEST_TAG}). Promote to 100%?"
+                        }
+                        container('kubectl') {
+                            // 1. Update Main Prod
+                            sh "kubectl set image deployment/fastapi-app fastapi-app=${NEXUS_REGISTRY_URL}/${IMAGE_NAME}:${env.LATEST_TAG} -n ${K8S_NAMESPACE}"
+                            sh "kubectl rollout status deployment/fastapi-app -n ${K8S_NAMESPACE}"
+                            
+                            // 2. Scale Canary to 0
+                            sh "kubectl scale deployment/fastapi-app-canary --replicas=0 -n ${K8S_NAMESPACE}"
+                        }
+                    } catch (err) {
+                        // If user aborts or timeout hits, scale canary to 0 so no users hit the "bad" version
+                        echo "Promotion aborted or failed. Scaling down canary for safety."
+                        container('kubectl') {
+                            sh "kubectl scale deployment/fastapi-app-canary --replicas=0 -n ${K8S_NAMESPACE}"
+                        }
+                        error("Deployment Aborted")
+                    }
+                }
+            }
+        }
+    }
+}

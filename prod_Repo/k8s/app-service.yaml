@@ -1,0 +1,15 @@
+apiVersion: v1
+kind: Service
+metadata:
+  name: fastapi-app-service
+  namespace: prod
+spec:
+  selector:
+    app: fastapi-app
+  ports:
+    - protocol: TCP
+      port: 80
+      targetPort: 8000
+      nodePort: 30025
+  type: NodePort
+

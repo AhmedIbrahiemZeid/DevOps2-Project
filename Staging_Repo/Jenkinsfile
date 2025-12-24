@@ -1,0 +1,282 @@
+pipeline {
+    agent none
+
+    environment {
+        NEXUS_REGISTRY_URL = '10.10.70.84:30051'
+        IMAGE_NAME         = 'docker-host/fastapi-postgres-app'
+        NEXUS_CRED_ID      = 'a4116a00-2da0-4947-9dcc-86ba51217d6d'
+        K8S_NAMESPACE      = 'staging'
+        IMAGE_TAG          = "latest-${env.BUILD_NUMBER}"
+    }
+
+    stages {
+
+        // STAGE 1: CHECKOUT AND STASH
+        stage('Checkout') {
+            agent any
+            steps {
+                echo "Checking out code..."
+                checkout scm
+
+                echo "Stashing source code..."
+                stash name: 'source', includes: '**/*'
+            }
+        }
+
+       // STAGE2: VALIDATE APPLICATION (SYNTAX CHECK)
+stage('Validate Application') {
+    agent {
+        kubernetes {
+            cloud 'kubernetes'
+            yaml '''
+apiVersion: v1
+kind: Pod
+spec:
+  containers:
+  - name: python
+    image: python:3.11-slim
+    command: ["cat"]
+    args: ["-"]
+    tty: true
+'''
+        }
+    }
+    steps {
+        container('python') {
+            echo "Unstashing source code..."
+            unstash 'source'
+
+            echo "Installing dependencies..."
+            sh 'pip install --no-cache-dir --default-timeout=600 -r requirements.txt'
+
+            echo "Running Python syntax check..."
+            sh '''
+            python -m compileall app
+            '''
+        }
+    }
+}
+
+
+stage('Build, Scan and Push') {
+    agent {
+        kubernetes {
+            cloud 'kubernetes'
+            yaml '''
+apiVersion: v1
+kind: Pod
+spec:
+  volumes:
+  - name: kaniko-tar
+    emptyDir: {}
+  containers:
+  - name: kaniko
+    image: gcr.io/kaniko-project/executor:debug
+    imagePullPolicy: Always
+    command: ["cat"]
+    args: ["-"]
+    tty: true
+    volumeMounts:
+    - name: kaniko-tar
+      mountPath: /shared-storage
+  - name: trivy
+    image: aquasec/trivy:latest
+    command: ["cat"]
+    tty: true
+    volumeMounts:
+    - name: kaniko-tar
+      mountPath: /shared-storage
+'''
+        }
+    }
+    steps {
+        container('kaniko') {
+            echo "Unstashing source code..."
+            unstash 'source'
+
+            withCredentials([usernamePassword(credentialsId: NEXUS_CRED_ID, usernameVariable: 'NEXUS_USER', passwordVariable: 'NEXUS_PASS')]) {
+
+                script {
+                    // Encode Nexus credentials for Kaniko push
+                    def encodedAuth = sh(
+                                script: "echo -n \"${NEXUS_USER}:${NEXUS_PASS}\" | base64",
+                                returnStdout: true
+                            ).trim()
+
+
+                    DOCKER_CONFIG_JSON = "{\"auths\":{\"${NEXUS_REGISTRY_URL}\":{\"auth\":\"${encodedAuth}\"}}}"
+                    sh "echo '${DOCKER_CONFIG_JSON}' > /kaniko/.docker/config.json"
+                }
+
+                // Ensure /kaniko exists
+                sh "mkdir -p /shared-storage"
+
+                echo "Building image as tar..."
+                sh """
+                /kaniko/executor \\
+                    --context=\$(pwd) \\
+                    --dockerfile=Dockerfile \\
+                    --destination=tmp-image:latest \\
+                    --tar-path=/shared-storage/image.tar \\
+                    --skip-tls-verify \\
+                    --insecure \\
+                    --no-push
+                """
+            }
+        }
+
+        container('trivy') {
+            echo "Running pre-push Trivy scan..."
+            sh """
+            trivy image --input /shared-storage/image.tar --severity HIGH,CRITICAL
+            """
+        }
+
+        container('kaniko') {
+            echo "Pushing image to Nexus..."
+            sh """
+            /kaniko/executor \\
+                --context=\$(pwd) \\
+                --dockerfile=Dockerfile \\
+                --destination=${NEXUS_REGISTRY_URL}/${IMAGE_NAME}:${IMAGE_TAG} \\
+                --skip-tls-verify \\
+                --insecure \\
+                --cache=true
+            """
+        }
+    }
+}
+
+stage('DB Migration') {
+    agent {
+        kubernetes {
+            cloud 'kubernetes'
+            yaml '''
+apiVersion: v1
+kind: Pod
+spec:
+  containers:
+  - name: git-tool
+    image: alpine/git:latest
+    command: ["cat"]
+    args: ["-"]
+    tty: true
+  - name: psql
+    image: postgres:15
+    command: ["cat"]
+    args: ["-"]
+    tty: true
+'''
+        }
+    }
+    steps {
+        script {
+ container('git-tool') {
+    echo "Checking for changes in the repository..."
+    checkout scm 
+    
+    script {
+        // 1. Fix the ownership security error
+        sh "git config --global --add safe.directory /home/jenkins/agent/workspace/Stating"
+        
+        // 2. Fetch history now that Git trusts the folder
+        sh "git fetch --unshallow || git fetch --depth=2"
+        
+        def lastCommit = env.GIT_PREVIOUS_SUCCESSFUL_COMMIT ?: "HEAD~1"
+        echo "Comparing ${lastCommit} to current commit ${env.GIT_COMMIT}"
+
+        def diff = sh(
+            script: "git diff --name-only ${lastCommit} ${env.GIT_COMMIT} | grep 'migrations/001_create_users_table.sql' || true",
+            returnStdout: true
+        ).trim()
+
+        if (diff == "") {
+            echo "Result: No changes found in the migration file."
+            env.SHOULD_MIGRATE = "false"
+        } else {
+            echo "Result: Change detected in ${diff}"
+            env.SHOULD_MIGRATE = "true"
+        }
+    }
+}
+
+            // 2. Only run the PSQL container if the check passed
+            if (env.SHOULD_MIGRATE == "true") {
+                container('psql') {
+                    echo "Starting migration..."
+                    unstash 'source'
+                    withCredentials([usernamePassword(
+                        credentialsId: 'STAGING_DB_CRED',
+                        usernameVariable: 'DB_USER',
+                        passwordVariable: 'DB_PASS'
+                    )]) {
+                        sh """
+                        export PGPASSWORD=\$DB_PASS
+                        psql -h postgres-0.postgres.staging.svc.cluster.local -U \$DB_USER -d mydb -f migrations/001_create_users_table.sql
+                        """
+                    }
+                }
+            }
+        }
+    }
+}
+
+        // STAGE 6: DEPLOY TO KUBERNETES
+        stage('Deploy') {
+            agent {
+                kubernetes {
+                    cloud 'kubernetes'
+                    yaml '''
+apiVersion: v1
+kind: Pod
+spec:
+  containers:
+  - name: kubectl
+    image: lachlanevenson/k8s-kubectl:latest
+    command: ["cat"]
+    args: ["-"]
+    tty: true
+    volumeMounts:
+      - name: kubeconfig
+        mountPath: /root/.kube
+        readOnly: true
+  volumes:
+    - name: kubeconfig
+      hostPath:
+        path: /home/zeid/.kube
+        type: Directory
+'''
+                }
+            }
+            steps {
+                container('kubectl') {
+                    echo "Deploying to Kubernetes..."
+                    unstash 'source'
+
+                    withCredentials([usernamePassword(
+                        credentialsId: NEXUS_CRED_ID,
+                        usernameVariable: 'NEXUS_USER',
+                        passwordVariable: 'NEXUS_PASS'
+                    )]) {
+                        sh """
+                        kubectl create secret docker-registry nexus-cred \\
+                            --docker-server=${NEXUS_REGISTRY_URL} \\
+                            --docker-username=${NEXUS_USER} \\
+                            --docker-password=${NEXUS_PASS} \\
+                            --docker-email=zeid@local \\
+                            --namespace ${K8S_NAMESPACE} \\
+                            --dry-run=client -o yaml | kubectl apply -f -
+                        """
+                    }
+                    sh """
+                    kubectl set image deployment/fastapi-app \\
+                        fastapi-app=${NEXUS_REGISTRY_URL}/${IMAGE_NAME}:${IMAGE_TAG} \\
+                        --namespace ${K8S_NAMESPACE}
+                    """
+                    sh "kubectl rollout status deployment/fastapi-app --namespace ${K8S_NAMESPACE}"
+                }
+            }
+        }
+}
+}
+
